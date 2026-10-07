@@ -245,6 +245,10 @@ app.get('/v1/models', async (c: Context) => {
     // Sort models by created timestamp (newest first)
     models.sort((a, b) => b.created - a.created)
 
+    for (const id of Object.keys(MODEL_ALIASES)) {
+      models.unshift({ id, object: 'model', created: 0, owned_by: 'anthropic' })
+    }
+
     const response_data: ModelsListResponse = {
       object: 'list',
       data: models,
@@ -260,11 +264,31 @@ app.get('/v1/models', async (c: Context) => {
   }
 })
 
+// Short names for Cursor's custom-model list. Cursor sends its own built-in Claude
+// models to Anthropic directly, so a name that doesn't start with "claude" is what
+// makes it route through the proxy.
+const MODEL_ALIASES: Record<string, { model: string; effort: string }> = {
+  'proxy-opus': { model: 'claude-opus-5-5', effort: 'medium' },
+}
+
 const messagesFn = async (c: Context) => {
   let headers: Record<string, string> = c.req.header() as Record<string, string>
   headers.host = 'api.anthropic.com'
   const body: AnthropicRequestBody = await c.req.json()
   const isStreaming = body.stream === true
+
+  const alias = MODEL_ALIASES[body.model]
+  if (alias) {
+    body.model = alias.model
+    body.output_config = {
+      ...((body.output_config as object) || {}),
+      effort: alias.effort,
+    }
+    // Opus 5.5 always thinks, and thinking requires the default sampling settings.
+    delete body.temperature
+    delete body.top_p
+    delete body.top_k
+  }
 
   // Bypass cursor enable openai key check
   if (isCursorKeyCheck(body)) {
@@ -383,15 +407,26 @@ const messagesFn = async (c: Context) => {
       return stream(c, async (stream) => {
         const converterState = createConverterState()
         const enableLogging = false
+        // An SSE line can be split across network reads; hold back the unfinished tail.
+        let carry = ''
 
         try {
           while (true) {
             const { done, value } = await reader.read()
             if (done) break
 
-            const chunk = decoder.decode(value, { stream: true })
+            let chunk = decoder.decode(value, { stream: true })
 
             if (transformToOpenAIFormat) {
+              const text = carry + chunk
+              const cut = text.lastIndexOf('\n')
+              if (cut === -1) {
+                carry = text
+                continue
+              }
+              carry = text.slice(cut + 1)
+              chunk = text.slice(0, cut + 1)
+
               if (enableLogging) {
                 console.log('🔄 [TRANSFORM MODE] Converting to OpenAI format')
               }
