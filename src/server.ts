@@ -271,6 +271,23 @@ const MODEL_ALIASES: Record<string, { model: string; effort: string }> = {
   'proxy-opus': { model: 'claude-opus-5-5', effort: 'medium' },
 }
 
+const ANTHROPIC_FIELDS = new Set([
+  'model',
+  'messages',
+  'system',
+  'max_tokens',
+  'metadata',
+  'stop_sequences',
+  'stream',
+  'temperature',
+  'top_p',
+  'top_k',
+  'tools',
+  'tool_choice',
+  'thinking',
+  'output_config',
+])
+
 const messagesFn = async (c: Context) => {
   let headers: Record<string, string> = c.req.header() as Record<string, string>
   headers.host = 'api.anthropic.com'
@@ -321,11 +338,25 @@ const messagesFn = async (c: Context) => {
         })
       }
 
+      if (body.stop && !body.stop_sequences) {
+        body.stop_sequences = Array.isArray(body.stop) ? body.stop : [body.stop]
+      }
+      if (body.max_completion_tokens && !body.max_tokens) {
+        body.max_tokens = body.max_completion_tokens
+      }
+      // Anthropic rejects unknown fields, and OpenAI clients send many (stream_options, n, user, ...).
+      for (const key of Object.keys(body)) {
+        if (!ANTHROPIC_FIELDS.has(key)) delete body[key]
+      }
+
       if (body.model.includes('opus')) {
         body.max_tokens = 32_000
       }
       if (body.model.includes('sonnet')) {
         body.max_tokens = 64_000
+      }
+      if (!body.max_tokens) {
+        body.max_tokens = 8_192
       }
     }
 
