@@ -16,6 +16,13 @@ import {
   processChunk,
   convertNonStreamingResponse,
 } from './utils/anthropic-to-openai-converter'
+import {
+  convertMessages,
+  convertToolChoice,
+  convertTools,
+  isSystemRole,
+  textOf,
+} from './utils/openai-to-anthropic-converter'
 import { corsPreflightHandler, corsMiddleware } from './utils/cors-bypass'
 import {
   isCursorKeyCheck,
@@ -320,8 +327,16 @@ const messagesFn = async (c: Context) => {
         "You are Claude Code, Anthropic's official CLI for Claude.",
       ) && body.messages
     ) {
-      const systemMessages = body.messages.filter((msg: any) => msg.role === 'system')
-      body.messages = body.messages?.filter((msg: any) => msg.role !== 'system')
+      const systemMessages = body.messages.filter((msg: any) => isSystemRole(msg.role))
+      body.messages = convertMessages(body.messages)
+      const tools = convertTools(body.tools)
+      if (tools) body.tools = tools
+      else delete body.tools
+      const toolChoice = tools
+        ? convertToolChoice(body.tool_choice, body.parallel_tool_calls)
+        : undefined
+      if (toolChoice) body.tool_choice = toolChoice
+      else delete body.tool_choice
       transformToOpenAIFormat = true // not claude-code, need to transform to openai format
       if (!body.system) {
         body.system = []
@@ -332,9 +347,10 @@ const messagesFn = async (c: Context) => {
       })
 
       for (const sysMsg of systemMessages) {
+        if (!textOf(sysMsg.content)) continue
         body.system.push({
           type: 'text',
-          text: sysMsg.content || ''
+          text: textOf(sysMsg.content),
         })
       }
 
