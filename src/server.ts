@@ -1,4 +1,5 @@
 import { Hono, Context, Next } from 'hono'
+import { logger } from 'hono/logger'
 import { stream } from 'hono/streaming'
 import { createHash, timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
@@ -32,6 +33,8 @@ import type {
 // Static files are served by Vercel, not needed here
 
 const app = new Hono()
+
+app.use('*', logger())
 
 // Handle CORS preflight requests for all routes
 app.options('*', corsPreflightHandler)
