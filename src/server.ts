@@ -434,9 +434,4 @@ const messagesFn = async (c: Context) => {
 app.post('/v1/chat/completions', messagesFn)
 app.post('/v1/messages', messagesFn)
 
-const port = process.env.PORT || 9095
-
-// Export app for Vercel
 export default app
-
-// Server is started differently for local development vs Vercel
