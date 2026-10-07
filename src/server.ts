@@ -1,5 +1,6 @@
-import { Hono, Context } from 'hono'
+import { Hono, Context, Next } from 'hono'
 import { stream } from 'hono/streaming'
+import { createHash, timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { getAccessToken } from './auth/oauth-manager'
@@ -37,6 +38,33 @@ app.options('*', corsPreflightHandler)
 
 // Also add CORS headers to all responses
 app.use('*', corsMiddleware)
+
+// Hashing both sides first makes the lengths equal, which timingSafeEqual requires.
+const keysMatch = (given: string, expected: string) =>
+  timingSafeEqual(
+    createHash('sha256').update(given).digest(),
+    createHash('sha256').update(expected).digest(),
+  )
+
+const requireApiKey = async (c: Context, next: Next) => {
+  const expected = process.env.API_KEY
+  if (!expected) return next()
+
+  const header = c.req.header('authorization') || c.req.header('x-api-key') || ''
+  const given = header.replace(/^Bearer\s+/i, '')
+  if (!given || !keysMatch(given, expected)) {
+    return c.json<ErrorResponse>(
+      { error: 'Unauthorized', message: 'Invalid API key' },
+      401,
+    )
+  }
+  return next()
+}
+
+app.use('/v1/*', requireApiKey)
+app.use('/auth/oauth/*', requireApiKey)
+app.use('/auth/login/*', requireApiKey)
+app.use('/auth/logout', requireApiKey)
 
 const indexHtmlPath = join(process.cwd(), 'public', 'index.html')
 let cachedIndexHtml: string | null = null
@@ -234,17 +262,6 @@ const messagesFn = async (c: Context) => {
   headers.host = 'api.anthropic.com'
   const body: AnthropicRequestBody = await c.req.json()
   const isStreaming = body.stream === true
-
-  const apiKey = c.req.header('authorization')?.split(' ')?.[1]
-  if (apiKey && apiKey !== process.env.API_KEY) {
-    return c.json(
-      {
-        error: 'Authentication required',
-        message: 'Please authenticate use the API key from the .env file',
-      },
-      401,
-    )
-  }
 
   // Bypass cursor enable openai key check
   if (isCursorKeyCheck(body)) {
