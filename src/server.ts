@@ -18,6 +18,7 @@ import {
   convertNonStreamingResponse,
 } from './utils/anthropic-to-openai-converter'
 import {
+  addCacheBreakpoints,
   convertMessages,
   convertToolChoice,
   convertTools,
@@ -397,6 +398,13 @@ const messagesFn = async (c: Context) => {
       if (!body.max_tokens) {
         body.max_tokens = 8_192
       }
+      addCacheBreakpoints(body)
+      // If these hashes change between steps of one agent run, the cache can't hit.
+      const hash = (v: unknown) =>
+        createHash('sha256').update(JSON.stringify(v ?? null)).digest('hex').slice(0, 8)
+      console.log(
+        `prefix tools=${hash(body.tools)} system=${hash(body.system)} messages=${body.messages?.length ?? 0}`,
+      )
     }
 
     const oauthToken = await getAccessToken()

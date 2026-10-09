@@ -77,11 +77,46 @@ interface OpenAIStreamChunk {
     }
     finish_reason: string | null
   }>
-  usage?: {
-    prompt_tokens: number
-    completion_tokens: number
-    total_tokens: number
+  usage?: OpenAIUsage
+}
+
+interface OpenAIUsage {
+  prompt_tokens: number
+  completion_tokens: number
+  total_tokens: number
+  prompt_tokens_details?: { cached_tokens: number }
+}
+
+type AnthropicUsage = {
+  input_tokens?: number
+  output_tokens?: number
+  cache_creation_input_tokens?: number
+  cache_read_input_tokens?: number
+}
+
+// Claude's input_tokens excludes cached tokens; OpenAI's prompt_tokens includes them.
+export function toOpenAIUsage(u: AnthropicUsage = {}): OpenAIUsage {
+  const read = u.cache_read_input_tokens || 0
+  const prompt = (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0) + read
+  const completion = u.output_tokens || 0
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    prompt_tokens_details: { cached_tokens: read },
   }
+}
+
+// One line per request in the Railway logs, so cache hit rate is visible.
+export function logUsage(model: string, u: AnthropicUsage = {}): void {
+  const read = u.cache_read_input_tokens || 0
+  const write = u.cache_creation_input_tokens || 0
+  const fresh = u.input_tokens || 0
+  const total = read + write + fresh
+  const hit = total ? Math.round((read / total) * 100) : 0
+  console.log(
+    `usage ${model} in=${total} cache_read=${read} cache_write=${write} uncached=${fresh} out=${u.output_tokens || 0} hit=${hit}%`,
+  )
 }
 
 interface OpenAIResponse {
@@ -105,11 +140,7 @@ interface OpenAIResponse {
     }
     finish_reason: string | null
   }>
-  usage: {
-    prompt_tokens: number
-    completion_tokens: number
-    total_tokens: number
-  }
+  usage: OpenAIUsage
 }
 
 // Internal types
@@ -185,14 +216,9 @@ export function convertNonStreamingResponse(
             : anthropicResponse.stop_reason || null,
       },
     ],
-    usage: {
-      prompt_tokens: anthropicResponse.usage?.input_tokens || 0,
-      completion_tokens: anthropicResponse.usage?.output_tokens || 0,
-      total_tokens:
-        (anthropicResponse.usage?.input_tokens || 0) +
-        (anthropicResponse.usage?.output_tokens || 0),
-    },
+    usage: toOpenAIUsage(anthropicResponse.usage),
   }
+  logUsage(openAIResponse.model, anthropicResponse.usage)
 
   // Process content blocks
   let textContent = ''
@@ -319,25 +345,28 @@ function updateMetrics(
     metricsData.stop_reason = data.delta.stop_reason
   }
 
-  if (data.usage) {
-    metricsData.input_tokens += data.usage.input_tokens || 0
-    metricsData.output_tokens += data.usage.output_tokens || 0
-    metricsData.cache_creation_input_tokens +=
-      data.usage.cache_creation_input_tokens || 0
-    metricsData.cache_read_input_tokens +=
-      data.usage.cache_read_input_tokens || 0
+  // message_start and message_delta both report usage, and the counts are cumulative,
+  // so keep the largest value seen rather than adding them up.
+  const take = (u: NonNullable<AnthropicStreamEvent['usage']>) => {
+    metricsData.input_tokens = Math.max(metricsData.input_tokens, u.input_tokens || 0)
+    metricsData.output_tokens = Math.max(metricsData.output_tokens, u.output_tokens || 0)
+    metricsData.cache_creation_input_tokens = Math.max(
+      metricsData.cache_creation_input_tokens,
+      u.cache_creation_input_tokens || 0,
+    )
+    metricsData.cache_read_input_tokens = Math.max(
+      metricsData.cache_read_input_tokens,
+      u.cache_read_input_tokens || 0,
+    )
   }
+
+  if (data.usage) take(data.usage)
 
   if (data?.message?.usage) {
     if (data?.message?.model) {
       metricsData.model = data.message.model
     }
-    metricsData.input_tokens += data.message.usage.input_tokens || 0
-    metricsData.output_tokens += data.message.usage.output_tokens || 0
-    metricsData.cache_creation_input_tokens +=
-      data.message.usage.cache_creation_input_tokens || 0
-    metricsData.cache_read_input_tokens +=
-      data.message.usage.cache_read_input_tokens || 0
+    take(data.message.usage)
   }
 
   if (data?.message?.stop_reason) {
@@ -354,6 +383,7 @@ function createUsageChunk(state: ConverterState): OpenAIStreamChunk | null {
   ) {
     return null
   }
+  logUsage(state.metricsData.model, state.metricsData)
 
   return {
     id: state.metricsData.openAIId || 'chatcmpl-' + Date.now(),
@@ -367,12 +397,7 @@ function createUsageChunk(state: ConverterState): OpenAIStreamChunk | null {
         finish_reason: null,
       },
     ],
-    usage: {
-      prompt_tokens: state.metricsData.input_tokens,
-      completion_tokens: state.metricsData.output_tokens,
-      total_tokens:
-        state.metricsData.input_tokens + state.metricsData.output_tokens,
-    },
+    usage: toOpenAIUsage(state.metricsData),
   }
 }
 

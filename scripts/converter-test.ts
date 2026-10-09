@@ -1,7 +1,12 @@
 // Offline checks for the OpenAI -> Anthropic message converter.
 // Run: npx tsx scripts/converter-test.ts
 import assert from 'node:assert/strict'
-import { convertMessages, sanitizeToolId } from '../src/utils/openai-to-anthropic-converter'
+import {
+  addCacheBreakpoints,
+  convertMessages,
+  sanitizeToolId,
+} from '../src/utils/openai-to-anthropic-converter'
+import { toOpenAIUsage } from '../src/utils/anthropic-to-openai-converter'
 
 const ID = /^[a-zA-Z0-9_-]+$/
 
@@ -76,5 +81,49 @@ checkValid(
     { role: 'tool', tool_call_id: 'dup', content: 'x again' },
   ]),
 )
+
+// 6. Prompt-cache breakpoints: tools, system, last message, previous user turn; never more than 4
+{
+  const marked = (blocks: any[] = []) => blocks.filter((b) => b.cache_control).length
+  const body: any = {
+    tools: [{ name: 'a' }, { name: 'b' }],
+    system: [{ type: 'text', text: 'one' }, { type: 'text', text: 'two' }],
+    messages: convertMessages([
+      { role: 'user', content: 'first' },
+      { role: 'assistant', content: null, tool_calls: [call('c1')] },
+      { role: 'tool', tool_call_id: 'c1', content: 'r1' },
+      { role: 'assistant', content: null, tool_calls: [call('c2')] },
+      { role: 'tool', tool_call_id: 'c2', content: 'r2' },
+    ]),
+  }
+  addCacheBreakpoints(body)
+  assert.ok(body.tools[1].cache_control && !body.tools[0].cache_control)
+  assert.ok(body.system[1].cache_control && !body.system[0].cache_control)
+  const msgs = body.messages
+  assert.ok(msgs[msgs.length - 1].content.at(-1).cache_control, 'last block marked')
+  assert.ok(msgs[msgs.length - 3].content.at(-1).cache_control, 'previous user turn marked')
+  const total =
+    marked(body.tools) + marked(body.system) + msgs.reduce((n: number, m: any) => n + marked(m.content), 0)
+  assert.equal(total, 4)
+
+  // Idempotent and respects marks the client already set.
+  addCacheBreakpoints(body)
+  const again =
+    marked(body.tools) + marked(body.system) + msgs.reduce((n: number, m: any) => n + marked(m.content), 0)
+  assert.equal(again, 4)
+
+  // Thinking blocks can't carry cache_control.
+  const t: any = { messages: [{ role: 'assistant', content: [{ type: 'text', text: 'x' }, { type: 'thinking', thinking: '...' }] }] }
+  addCacheBreakpoints(t)
+  assert.ok(t.messages[0].content[0].cache_control && !t.messages[0].content[1].cache_control)
+}
+
+// 7. Usage: OpenAI prompt_tokens includes cached tokens
+{
+  const u = toOpenAIUsage({ input_tokens: 10, cache_creation_input_tokens: 100, cache_read_input_tokens: 5000, output_tokens: 7 })
+  assert.equal(u.prompt_tokens, 5110)
+  assert.equal(u.prompt_tokens_details?.cached_tokens, 5000)
+  assert.equal(u.total_tokens, 5117)
+}
 
 console.log('converter tests passed')

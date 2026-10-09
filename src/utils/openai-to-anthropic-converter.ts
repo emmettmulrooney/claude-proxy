@@ -173,6 +173,68 @@ export function convertMessages(messages: AnyRecord[]): AnyRecord[] {
   return repairToolPairing(out)
 }
 
+// Prompt caching. Cursor resends the whole conversation every agent step, so without
+// cache breakpoints every step pays full price for tools + system + history.
+// Claude caches the prefix up to each block marked with cache_control (max 4 marks):
+//   1. last tool          -> tool definitions (stable all session)
+//   2. last system block  -> tools + system prompt
+//   3. last message block -> the whole conversation so far; next step reads it back
+//   4. previous user turn -> backstop so a long step (>20 blocks) still finds a hit
+// Marks are only placed on blocks that can carry them (not thinking blocks or empty text).
+const EPHEMERAL = { type: 'ephemeral' } as const
+const MAX_BREAKPOINTS = 4
+
+function canCache(block: AnyRecord | undefined): boolean {
+  if (!block || typeof block !== 'object') return false
+  if (block.type === 'thinking' || block.type === 'redacted_thinking') return false
+  if (block.type === 'text' && !block.text) return false
+  return true
+}
+
+function countBreakpoints(body: AnyRecord): number {
+  let n = 0
+  const scan = (blocks: unknown) => {
+    if (!Array.isArray(blocks)) return
+    for (const b of blocks) if (b?.cache_control) n++
+  }
+  scan(body.tools)
+  scan(body.system)
+  for (const m of body.messages || []) scan(m.content)
+  return n
+}
+
+function markLast(blocks: unknown, budget: { left: number }): void {
+  if (budget.left <= 0 || !Array.isArray(blocks)) return
+  for (let i = blocks.length - 1; i >= 0; i--) {
+    if (!canCache(blocks[i])) continue
+    if (!blocks[i].cache_control) {
+      blocks[i].cache_control = EPHEMERAL
+      budget.left--
+    }
+    return
+  }
+}
+
+export function addCacheBreakpoints(body: AnyRecord): void {
+  const budget = { left: MAX_BREAKPOINTS - countBreakpoints(body) }
+  markLast(body.tools, budget)
+  markLast(body.system, budget)
+
+  const messages: AnyRecord[] = body.messages || []
+  const last = messages[messages.length - 1]
+  if (last) markLast(last.content, budget)
+
+  // The user turn before the last assistant turn: where the previous step's cache ended.
+  let seenAssistant = false
+  for (let i = messages.length - 2; i >= 0; i--) {
+    if (messages[i].role === 'assistant') seenAssistant = true
+    else if (seenAssistant) {
+      markLast(messages[i].content, budget)
+      break
+    }
+  }
+}
+
 // Anthropic rejects a conversation unless every tool_use is answered by a tool_result
 // in the very next user turn, and every tool_result answers a tool_use in the turn
 // right before it. Cancelled or interrupted Cursor runs break that, so fix it up:
