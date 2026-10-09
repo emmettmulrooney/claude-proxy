@@ -704,22 +704,12 @@
         const quotaEl = document.getElementById('quota')
         const note = document.getElementById('quotaNote')
         quotaEl.hidden = false
-        const rows = quotaEl.querySelectorAll('.quota-row')
-        const key = document.getElementById('proxyKey').value.trim()
-        if (!key) {
-          rows.forEach((row) => {
-            row.hidden = true
-          })
-          note.textContent =
-            'Enter your proxy key to see the 5-hour and 1-week quotas.'
-          return
-        }
-        rows.forEach((row) => {
+        quotaEl.querySelectorAll('.quota-row').forEach((row) => {
           row.hidden = false
         })
         note.textContent = 'Loading quotas…'
         try {
-          const response = await fetch('/auth/usage', { headers: keyHeaders() })
+          const response = await fetch('/auth/usage')
           if (!response.ok) {
             note.textContent = await readError(response, 'Could not load quotas')
             return
@@ -802,10 +792,7 @@
 
       document.getElementById('proxyKey').addEventListener('change', () => {
         const authView = document.getElementById('authenticatedView')
-        if (authView.style.display !== 'none') {
-          loadQuota()
-          loadObs()
-        }
+        if (authView.style.display !== 'none') loadObs()
       })
 
       // Check auth status on load

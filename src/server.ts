@@ -86,7 +86,6 @@ app.use('/auth/oauth/*', requireApiKey)
 app.use('/auth/login/*', requireApiKey)
 app.use('/auth/logout', requireApiKey)
 app.use('/obs/*', requireApiKey)
-app.use('/auth/usage', requireApiKey)
 
 const indexHtmlPath = join(process.cwd(), 'public', 'index.html')
 let cachedIndexHtml: string | null = null
