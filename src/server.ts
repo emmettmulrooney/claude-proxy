@@ -5,6 +5,7 @@ import { createHash, timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { getAccessToken } from './auth/oauth-manager'
+import { getClaudeQuota } from './auth/usage'
 import {
   login as oauthLogin,
   logout as oauthLogout,
@@ -75,6 +76,7 @@ app.use('/v1/*', requireApiKey)
 app.use('/auth/oauth/*', requireApiKey)
 app.use('/auth/login/*', requireApiKey)
 app.use('/auth/logout', requireApiKey)
+app.use('/auth/usage', requireApiKey)
 
 const indexHtmlPath = join(process.cwd(), 'public', 'index.html')
 let cachedIndexHtml: string | null = null
@@ -199,6 +201,27 @@ app.get('/auth/status', async (c: Context) => {
     return c.json({ authenticated: !!token })
   } catch (error) {
     return c.json({ authenticated: false })
+  }
+})
+
+app.get('/auth/usage', async (c: Context) => {
+  try {
+    const quota = await getClaudeQuota()
+    if (!quota) {
+      return c.json<ErrorResponse>(
+        {
+          error: 'Authentication required',
+          message: 'Connect Claude before checking quota.',
+        },
+        401,
+      )
+    }
+    return c.json(quota)
+  } catch (error) {
+    return c.json<ErrorResponse>(
+      { error: 'Usage unavailable', message: (error as Error).message },
+      502,
+    )
   }
 })
 

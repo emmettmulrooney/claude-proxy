@@ -317,6 +317,54 @@
         margin-bottom: 1.5rem;
         font-size: 0.875rem;
       }
+
+      .quota {
+        text-align: left;
+        margin-bottom: 1.5rem;
+        display: flex;
+        flex-direction: column;
+        gap: 1rem;
+      }
+
+      .quota-head {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.875rem;
+        margin-bottom: 0.375rem;
+      }
+
+      .quota-head span:first-child {
+        font-weight: 500;
+        color: hsl(var(--card-foreground));
+      }
+
+      .quota-pct {
+        color: hsl(var(--muted-foreground));
+      }
+
+      .quota-track {
+        height: 0.375rem;
+        background: hsl(var(--muted));
+        border-radius: 999px;
+        overflow: hidden;
+      }
+
+      .quota-fill {
+        height: 100%;
+        width: 0;
+        background: hsl(var(--primary));
+        border-radius: 999px;
+      }
+
+      .quota-fill.high {
+        background: hsl(var(--destructive));
+      }
+
+      .quota-reset {
+        font-size: 0.75rem;
+        color: hsl(var(--muted-foreground));
+        margin-top: 0.375rem;
+      }
     </style>
   </head>
   <body>
@@ -334,6 +382,25 @@
       <div id="authenticatedView" style="display: none">
         <div class="authenticated-content">
           <p>You are successfully authenticated with Claude</p>
+          <div id="quota" class="quota" hidden>
+            <div class="quota-row" data-window="five_hour">
+              <div class="quota-head">
+                <span>5-hour</span>
+                <span class="quota-pct"></span>
+              </div>
+              <div class="quota-track"><div class="quota-fill"></div></div>
+              <p class="quota-reset"></p>
+            </div>
+            <div class="quota-row" data-window="seven_day">
+              <div class="quota-head">
+                <span>1-week</span>
+                <span class="quota-pct"></span>
+              </div>
+              <div class="quota-track"><div class="quota-fill"></div></div>
+              <p class="quota-reset"></p>
+            </div>
+            <p id="quotaNote" class="help-text"></p>
+          </div>
           <button class="button-secondary" onclick="logout()">
             <i data-lucide="log-out"></i>
             Sign Out
@@ -418,6 +485,7 @@
             statusEl.innerHTML = '<i data-lucide="check"></i> Authenticated'
             authView.style.display = 'block'
             unauthView.style.display = 'none'
+            await loadQuota()
           } else {
             statusEl.className = 'status'
             statusEl.innerHTML = '<i data-lucide="x"></i> Not authenticated'
@@ -533,6 +601,71 @@
         }
       }
 
+      function renderWindow(row, window) {
+        const pct = row.querySelector('.quota-pct')
+        const fill = row.querySelector('.quota-fill')
+        const reset = row.querySelector('.quota-reset')
+        if (!window || typeof window.utilization !== 'number') {
+          pct.textContent = '—'
+          fill.style.width = '0%'
+          fill.classList.remove('high')
+          reset.textContent = 'Not reported for this account'
+          return
+        }
+        const used = Math.max(0, Math.min(100, window.utilization))
+        pct.textContent = `${Math.round(used)}% used`
+        fill.style.width = `${used}%`
+        fill.classList.toggle('high', used >= 90)
+        reset.textContent = window.resets_at
+          ? `Resets ${new Date(window.resets_at).toLocaleString(undefined, {
+              weekday: 'short',
+              month: 'short',
+              day: 'numeric',
+              hour: 'numeric',
+              minute: '2-digit',
+            })}`
+          : 'Reset time unavailable'
+      }
+
+      async function loadQuota() {
+        const quotaEl = document.getElementById('quota')
+        const note = document.getElementById('quotaNote')
+        quotaEl.hidden = false
+        const rows = quotaEl.querySelectorAll('.quota-row')
+        const key = document.getElementById('proxyKey').value.trim()
+        if (!key) {
+          rows.forEach((row) => {
+            row.hidden = true
+          })
+          note.textContent =
+            'Enter your proxy key to see the 5-hour and 1-week quotas.'
+          return
+        }
+        rows.forEach((row) => {
+          row.hidden = false
+        })
+        note.textContent = 'Loading quotas…'
+        try {
+          const response = await fetch('/auth/usage', { headers: keyHeaders() })
+          if (!response.ok) {
+            note.textContent = await readError(response, 'Could not load quotas')
+            return
+          }
+          const data = await response.json()
+          renderWindow(
+            quotaEl.querySelector('[data-window="five_hour"]'),
+            data.five_hour,
+          )
+          renderWindow(
+            quotaEl.querySelector('[data-window="seven_day"]'),
+            data.seven_day,
+          )
+          note.textContent = ''
+        } catch (error) {
+          note.textContent = 'Could not load quotas'
+        }
+      }
+
       function showError(message) {
         const errorEl = document.getElementById('errorMessage')
         const errorText = document.getElementById('errorText')
@@ -543,6 +676,11 @@
           errorEl.style.display = 'none'
         }, 5000)
       }
+
+      document.getElementById('proxyKey').addEventListener('change', () => {
+        const authView = document.getElementById('authenticatedView')
+        if (authView.style.display !== 'none') loadQuota()
+      })
 
       // Check auth status on load
       checkAuthStatus()
