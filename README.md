@@ -134,6 +134,16 @@ You can optionally set an `API_KEY` environment variable for additional security
 - Useful when deploying to public URLs
 - Leave empty to use without additional authentication
 
+## Observability
+
+- **Logs**: one JSON object per line. Every proxied call logs `{"evt":"request", ...}` (or `request_error`) with id, model, status, duration, token counts (`cache_read`, `cache_write`, `uncached`, `out`) and `tools_hash`/`system_hash`. `railway logs | grep '"evt":"request_error"'` finds failures.
+- **Request id**: every response carries `x-proxy-request-id`, matching the `id` in the log line.
+- **`GET /obs/stats`** (API key required): last hour and last 24h totals, cache hit rate, p95 latency, error count, `prefix_changes`, and the last 20 requests. History is the last 2000 requests in Redis (`obs:requests`).
+- **`GET /obs/summary`** (API key required): Haiku's plain-English read of those stats, cached 10 minutes. Add `?fresh=1` to regenerate.
+- **Status page**: shows the same stats and summary once the proxy key is entered.
+
+Reading the cache numbers: after the first request of a session the hit rate should be above 80%. If `prefix_changes` is high, tools or system prompt are changing between requests, so every request rewrites the cache.
+
 ## 🛡️ Security
 
 - Uses your existing Claude session for authentication

@@ -123,7 +123,6 @@ async function getAccessToken(): Promise<string | null> {
 
   // Check if token is expired
   if (credentials.expires && credentials.expires > Date.now()) {
-    console.log('Token is valid')
     return credentials.access
   }
 

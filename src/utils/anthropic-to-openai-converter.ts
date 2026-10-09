@@ -107,18 +107,6 @@ export function toOpenAIUsage(u: AnthropicUsage = {}): OpenAIUsage {
   }
 }
 
-// One line per request in the Railway logs, so cache hit rate is visible.
-export function logUsage(model: string, u: AnthropicUsage = {}): void {
-  const read = u.cache_read_input_tokens || 0
-  const write = u.cache_creation_input_tokens || 0
-  const fresh = u.input_tokens || 0
-  const total = read + write + fresh
-  const hit = total ? Math.round((read / total) * 100) : 0
-  console.log(
-    `usage ${model} in=${total} cache_read=${read} cache_write=${write} uncached=${fresh} out=${u.output_tokens || 0} hit=${hit}%`,
-  )
-}
-
 interface OpenAIResponse {
   id: string
   object: 'chat.completion'
@@ -218,8 +206,6 @@ export function convertNonStreamingResponse(
     ],
     usage: toOpenAIUsage(anthropicResponse.usage),
   }
-  logUsage(openAIResponse.model, anthropicResponse.usage)
-
   // Process content blocks
   let textContent = ''
   for (const block of anthropicResponse.content || []) {
@@ -383,8 +369,6 @@ function createUsageChunk(state: ConverterState): OpenAIStreamChunk | null {
   ) {
     return null
   }
-  logUsage(state.metricsData.model, state.metricsData)
-
   return {
     id: state.metricsData.openAIId || 'chatcmpl-' + Date.now(),
     object: 'chat.completion.chunk' as const,

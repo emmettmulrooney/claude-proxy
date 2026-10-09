@@ -7,6 +7,14 @@ import { join } from 'node:path'
 import { getAccessToken } from './auth/oauth-manager'
 import { getClaudeQuota } from './auth/usage'
 import {
+  getStats,
+  getSummary,
+  log,
+  newRequestId,
+  recordRequest,
+  type RequestRecord,
+} from './observability'
+import {
   login as oauthLogin,
   logout as oauthLogout,
   generateAuthSession,
@@ -77,6 +85,7 @@ app.use('/v1/*', requireApiKey)
 app.use('/auth/oauth/*', requireApiKey)
 app.use('/auth/login/*', requireApiKey)
 app.use('/auth/logout', requireApiKey)
+app.use('/obs/*', requireApiKey)
 app.use('/auth/usage', requireApiKey)
 
 const indexHtmlPath = join(process.cwd(), 'public', 'index.html')
@@ -239,7 +248,7 @@ app.get('/v1/models', async (c: Context) => {
 
     if (!response.ok) {
       const error = await response.text()
-      console.error('API Error:', error)
+      log('models_error', { status: response.status, message: error.slice(0, 300) })
       return new Response(error, {
         status: response.status,
         headers: { 'Content-Type': 'text/plain' },
@@ -287,7 +296,7 @@ app.get('/v1/models', async (c: Context) => {
 
     return c.json(response_data)
   } catch (error) {
-    console.error('Proxy error:', error)
+    log('models_error', { message: (error as Error).message })
     return c.json<ErrorResponse>(
       { error: 'Proxy error', details: (error as Error).message },
       500,
@@ -319,11 +328,87 @@ const ANTHROPIC_FIELDS = new Set([
   'output_config',
 ])
 
+type MetricsUsage = {
+  input_tokens: number
+  output_tokens: number
+  cache_creation_input_tokens: number
+  cache_read_input_tokens: number
+}
+
+// Direct call to Claude with the stored OAuth token, for the proxy's own needs (the Haiku summary).
+const callClaude = async (body: Record<string, unknown>): Promise<Response> => {
+  const token = await getAccessToken()
+  if (!token) throw new Error('Not authenticated with Claude')
+  return fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${token}`,
+      'anthropic-beta': 'oauth-2025-04-20',
+      'anthropic-version': '2023-06-01',
+      'user-agent': '@anthropic-ai/sdk 1.2.12 node/22.13.1',
+    },
+    body: JSON.stringify(body),
+  })
+}
+
+// Observability: raw stats for agents/scripts, and a Haiku-written summary for people.
+app.get('/obs/stats', async (c) => {
+  try {
+    return c.json(await getStats())
+  } catch (error) {
+    log('obs_error', { route: 'stats', message: (error as Error).message })
+    return c.json<ErrorResponse>({ error: 'Stats unavailable', message: (error as Error).message }, 502)
+  }
+})
+
+app.get('/obs/summary', async (c) => {
+  try {
+    return c.json(await getSummary(callClaude, c.req.query('fresh') === '1'))
+  } catch (error) {
+    log('obs_error', { route: 'summary', message: (error as Error).message })
+    return c.json<ErrorResponse>({ error: 'Summary unavailable', message: (error as Error).message }, 502)
+  }
+})
+
+const prefixHash = (v: unknown) =>
+  v == null ? undefined : createHash('sha256').update(JSON.stringify(v)).digest('hex').slice(0, 8)
+
 const messagesFn = async (c: Context) => {
   let headers: Record<string, string> = c.req.header() as Record<string, string>
   headers.host = 'api.anthropic.com'
   const body: AnthropicRequestBody = await c.req.json()
   const isStreaming = body.stream === true
+
+  const rec: RequestRecord = {
+    id: newRequestId(),
+    t: Date.now(),
+    ms: 0,
+    path: c.req.path,
+    model: String(body.model),
+    stream: isStreaming,
+    status: 0,
+    in: 0,
+    cache_read: 0,
+    cache_write: 0,
+    uncached: 0,
+    out: 0,
+    messages: Array.isArray(body.messages) ? body.messages.length : 0,
+  }
+  c.header('x-proxy-request-id', rec.id)
+  const finish = (status: number, usage?: Partial<MetricsUsage>, error?: string) => {
+    rec.status = status
+    rec.ms = Date.now() - rec.t
+    if (usage) {
+      rec.uncached = usage.input_tokens || 0
+      rec.cache_read = usage.cache_read_input_tokens || 0
+      rec.cache_write = usage.cache_creation_input_tokens || 0
+      rec.out = usage.output_tokens || 0
+      rec.in = rec.uncached + rec.cache_read + rec.cache_write
+    }
+    if (error) rec.error = error.slice(0, 500)
+    void recordRequest(rec)
+  }
 
   const alias = MODEL_ALIASES[body.model]
   if (alias) {
@@ -399,17 +484,16 @@ const messagesFn = async (c: Context) => {
         body.max_tokens = 8_192
       }
       addCacheBreakpoints(body)
-      // If these hashes change between steps of one agent run, the cache can't hit.
-      const hash = (v: unknown) =>
-        createHash('sha256').update(JSON.stringify(v ?? null)).digest('hex').slice(0, 8)
-      console.log(
-        `prefix tools=${hash(body.tools)} system=${hash(body.system)} messages=${body.messages?.length ?? 0}`,
-      )
     }
+    // If these change between steps of one agent run, the cache can't hit.
+    rec.model = String(body.model)
+    rec.tools_hash = prefixHash(body.tools)
+    rec.system_hash = prefixHash(body.system)
 
     const oauthToken = await getAccessToken()
 
     if (!oauthToken) {
+      finish(401, undefined, 'no OAuth token')
       return c.json<ErrorResponse>(
         {
           error: 'Authentication required',
@@ -449,7 +533,7 @@ const messagesFn = async (c: Context) => {
 
     if (!response.ok) {
       const error = await response.text()
-      console.error('API Error:', error)
+      finish(response.status, undefined, error)
 
       if (response.status === 401) {
         return c.json<ErrorResponse>(
@@ -464,7 +548,7 @@ const messagesFn = async (c: Context) => {
       }
       return new Response(error, {
         status: response.status,
-        headers: { 'Content-Type': 'text/plain' },
+        headers: { 'Content-Type': 'text/plain', 'x-proxy-request-id': rec.id },
       })
     }
 
@@ -484,68 +568,47 @@ const messagesFn = async (c: Context) => {
 
       return stream(c, async (stream) => {
         const converterState = createConverterState()
-        const enableLogging = false
         // An SSE line can be split across network reads; hold back the unfinished tail.
         let carry = ''
+        let streamError: string | undefined
 
         try {
           while (true) {
             const { done, value } = await reader.read()
             if (done) break
 
-            let chunk = decoder.decode(value, { stream: true })
+            const raw = decoder.decode(value, { stream: true })
+            const text = carry + raw
+            const cut = text.lastIndexOf('\n')
+            const complete = cut === -1 ? '' : text.slice(0, cut + 1)
+            carry = cut === -1 ? text : text.slice(cut + 1)
 
-            if (transformToOpenAIFormat) {
-              const text = carry + chunk
-              const cut = text.lastIndexOf('\n')
-              if (cut === -1) {
-                carry = text
-                continue
+            if (!transformToOpenAIFormat) {
+              // Claude-format clients get the bytes untouched; parse only to read usage.
+              await stream.write(raw)
+              if (complete) processChunk(converterState, complete)
+              continue
+            }
+            if (!complete) continue
+
+            for (const result of processChunk(converterState, complete)) {
+              if (result.type === 'chunk') {
+                await stream.write(`data: ${JSON.stringify(result.data)}\n\n`)
+              } else if (result.type === 'done') {
+                await stream.write('data: [DONE]\n\n')
               }
-              carry = text.slice(cut + 1)
-              chunk = text.slice(0, cut + 1)
-
-              if (enableLogging) {
-                console.log('🔄 [TRANSFORM MODE] Converting to OpenAI format')
-              }
-
-              const results = processChunk(converterState, chunk, enableLogging)
-
-              for (const result of results) {
-                if (result.type === 'chunk') {
-                  const dataToSend = `data: ${JSON.stringify(result.data)}\n\n`
-                  if (enableLogging) {
-                    console.log('✅ [SENDING] OpenAI Chunk:', dataToSend)
-                  }
-                  await stream.write(dataToSend)
-                } else if (result.type === 'done') {
-                  await stream.write('data: [DONE]\n\n')
-                }
-              }
-            } else {
-              await stream.write(chunk)
             }
           }
         } catch (error) {
-          console.error('Stream error:', error)
+          streamError = `stream: ${(error as Error).message}`
         } finally {
           reader.releaseLock()
+          finish(200, converterState.metricsData, streamError)
         }
       })
     } else {
       const responseData = (await response.json()) as AnthropicResponse
-
-      if (transformToOpenAIFormat) {
-        const openAIResponse = convertNonStreamingResponse(responseData)
-
-        response.headers.forEach((value, key) => {
-          if (key.toLowerCase() !== 'content-encoding') {
-            c.header(key, value)
-          }
-        })
-
-        return c.json(openAIResponse)
-      }
+      finish(200, responseData.usage)
 
       response.headers.forEach((value, key) => {
         if (key.toLowerCase() !== 'content-encoding') {
@@ -553,10 +616,13 @@ const messagesFn = async (c: Context) => {
         }
       })
 
+      if (transformToOpenAIFormat) {
+        return c.json(convertNonStreamingResponse(responseData))
+      }
       return c.json(responseData)
     }
   } catch (error) {
-    console.error('Proxy error:', error)
+    finish(500, undefined, `proxy: ${(error as Error).message}`)
     return c.json<ErrorResponse>(
       { error: 'Proxy error', details: (error as Error).message },
       500,
