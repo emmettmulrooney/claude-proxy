@@ -77,6 +77,8 @@ function convertContentPart(part: any): AnyRecord | null {
       : { type: 'image', source: { type: 'url', url } }
   }
   // Already Anthropic-shaped (image, document, tool_use, tool_result, ...)
+  if (part.type === 'tool_use') return { ...part, id: sanitizeToolId(part.id) }
+  if (part.type === 'tool_result') return { ...part, tool_use_id: sanitizeToolId(part.tool_use_id) }
   return part
 }
 
@@ -98,8 +100,32 @@ function parseArguments(args: unknown): unknown {
   }
 }
 
+const TOOL_ID_PATTERN = /^[a-zA-Z0-9_-]+$/
+const MAX_TOOL_ID_LENGTH = 64
+
+// 32-bit FNV-1a, enough to keep two sanitized IDs from colliding.
+function shortHash(s: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(36)
+}
+
+// Anthropic requires tool_use.id / tool_result.tool_use_id to match ^[a-zA-Z0-9_-]+$.
+// Cursor's IDs don't always, so map them deterministically: the same input always
+// yields the same output, keeping tool_use and tool_result paired.
+export function sanitizeToolId(id: unknown): string {
+  const raw = id == null ? '' : String(id)
+  if (raw && TOOL_ID_PATTERN.test(raw) && raw.length <= MAX_TOOL_ID_LENGTH) return raw
+  const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, MAX_TOOL_ID_LENGTH - 10)
+  return `${cleaned || 'toolu'}_${shortHash(raw)}`
+}
+
 export function convertMessages(messages: AnyRecord[]): AnyRecord[] {
   const out: AnyRecord[] = []
+  let missingIdCount = 0
 
   const push = (role: 'user' | 'assistant', blocks: AnyRecord[]) => {
     if (!blocks.length) return
@@ -118,7 +144,7 @@ export function convertMessages(messages: AnyRecord[]): AnyRecord[] {
       push('user', [
         {
           type: 'tool_result',
-          tool_use_id: msg.tool_call_id,
+          tool_use_id: sanitizeToolId(msg.tool_call_id),
           content: textOf(msg.content) || '(no output)',
         },
       ])
@@ -129,9 +155,10 @@ export function convertMessages(messages: AnyRecord[]): AnyRecord[] {
       const blocks = convertContent(msg.content)
       for (const call of msg.tool_calls || []) {
         const fn = call.function || call.custom || {}
+        if (!fn.name) continue
         blocks.push({
           type: 'tool_use',
-          id: call.id,
+          id: call.id ? sanitizeToolId(call.id) : `toolu_missing_${++missingIdCount}`,
           name: fn.name,
           input: call.custom ? { input: fn.input ?? '' } : parseArguments(fn.arguments),
         })
@@ -143,14 +170,76 @@ export function convertMessages(messages: AnyRecord[]): AnyRecord[] {
     push('user', convertContent(msg.content))
   }
 
-  // Tool results must come first in their user turn.
-  for (const m of out) {
-    if (m.role === 'user' && m.content.some((b: AnyRecord) => b.type === 'tool_result')) {
-      m.content.sort(
-        (a: AnyRecord, b: AnyRecord) =>
-          Number(b.type === 'tool_result') - Number(a.type === 'tool_result'),
+  return repairToolPairing(out)
+}
+
+// Anthropic rejects a conversation unless every tool_use is answered by a tool_result
+// in the very next user turn, and every tool_result answers a tool_use in the turn
+// right before it. Cancelled or interrupted Cursor runs break that, so fix it up:
+// add placeholder results for unanswered calls and drop results with no call.
+function repairToolPairing(messages: AnyRecord[]): AnyRecord[] {
+  const out: AnyRecord[] = []
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]
+
+    if (msg.role === 'assistant') {
+      // Duplicate tool_use ids are also rejected; keep the first.
+      const seen = new Set<string>()
+      msg.content = msg.content.filter((b: AnyRecord) => {
+        if (b.type !== 'tool_use') return true
+        if (seen.has(b.id)) return false
+        seen.add(b.id)
+        return true
+      })
+      if (!msg.content.length) continue
+      out.push(msg)
+
+      if (!seen.size) continue
+      let next = messages[i + 1]
+      if (!next || next.role !== 'user') {
+        next = { role: 'user', content: [] }
+        messages.splice(i + 1, 0, next)
+      }
+      const answered = new Set(
+        next.content.filter((b: AnyRecord) => b.type === 'tool_result').map((b: AnyRecord) => b.tool_use_id),
       )
+      for (const id of seen) {
+        if (!answered.has(id)) {
+          next.content.push({
+            type: 'tool_result',
+            tool_use_id: id,
+            content: '(tool call was cancelled before it returned a result)',
+            is_error: true,
+          })
+        }
+      }
+      continue
     }
+
+    // User turn: keep only results that answer the preceding assistant turn.
+    const prev = out[out.length - 1]
+    const validIds = new Set(
+      prev?.role === 'assistant'
+        ? prev.content.filter((b: AnyRecord) => b.type === 'tool_use').map((b: AnyRecord) => b.id)
+        : [],
+    )
+    const usedIds = new Set<string>()
+    msg.content = msg.content.filter((b: AnyRecord) => {
+      if (b.type !== 'tool_result') return true
+      if (!validIds.has(b.tool_use_id) || usedIds.has(b.tool_use_id)) return false
+      usedIds.add(b.tool_use_id)
+      return true
+    })
+    // Tool results must come first in their user turn.
+    msg.content.sort(
+      (a: AnyRecord, b: AnyRecord) =>
+        Number(b.type === 'tool_result') - Number(a.type === 'tool_result'),
+    )
+    if (!msg.content.length) continue
+
+    const last = out[out.length - 1]
+    if (last?.role === 'user') last.content.push(...msg.content)
+    else out.push(msg)
   }
   return out
 }
